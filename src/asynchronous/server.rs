@@ -30,7 +30,7 @@ use tokio::{
 #[cfg(target_os = "linux")]
 use tokio_vsock::VsockListener;
 
-use crate::asynchronous::unix_incoming::UnixIncoming;
+use crate::asynchronous::{stream::SendingMessage, unix_incoming::UnixIncoming};
 use crate::common::{self, Domain};
 use crate::context;
 use crate::error::{get_status, Error, Result};
@@ -329,7 +329,7 @@ struct ServerWriter {
 
 #[async_trait]
 impl WriterDelegate for ServerWriter {
-    async fn recv(&mut self) -> Option<GenMessage> {
+    async fn recv(&mut self) -> Option<SendingMessage> {
         self.rx.recv().await
     }
     async fn disconnect(&self, _msg: &GenMessage, _: Error) {}
@@ -437,7 +437,7 @@ impl HandlerContext {
                         };
 
                         self.tx
-                            .send(msg)
+                            .send(SendingMessage::new(msg))
                             .await
                             .map_err(err_to_others_err!(e, "Send packet to sender error "))
                             .ok();
@@ -644,7 +644,7 @@ impl HandlerContext {
             header: MessageHeader::new_response(stream_id, payload.len() as u32),
             payload,
         };
-        tx.send(msg)
+        tx.send(SendingMessage::new(msg))
             .await
             .map_err(err_to_others_err!(e, "Send packet to sender error "))
     }
