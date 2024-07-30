@@ -371,12 +371,14 @@ impl ReaderDelegate for ServerReader {
     async fn handle_msg(&self, msg: GenMessage) {
         let handler_shutdown_waiter = self.handler_shutdown.subscribe();
         let context = self.context();
+        let (wait_tx, wait_rx) = tokio::sync::oneshot::channel::<()>();
         spawn(async move {
             select! {
-                _ = context.handle_msg(msg) => {}
+                _ = context.handle_msg(msg, wait_tx) => {}
                 _ = handler_shutdown_waiter.wait_shutdown() => {}
             }
         });
+        wait_rx.await.unwrap_or_default();
     }
 }
 
@@ -402,7 +404,7 @@ struct HandlerContext {
 }
 
 impl HandlerContext {
-    async fn handle_msg(&self, msg: GenMessage) {
+    async fn handle_msg(&self, msg: GenMessage, wait_tx: tokio::sync::oneshot::Sender<()>) {
         let stream_id = msg.header.stream_id;
 
         if (stream_id % 2) != 1 {
@@ -416,7 +418,7 @@ impl HandlerContext {
         }
 
         match msg.header.type_ {
-            MESSAGE_TYPE_REQUEST => match self.handle_request(msg).await {
+            MESSAGE_TYPE_REQUEST => match self.handle_request(msg, wait_tx).await {
                 Ok(opt_msg) => match opt_msg {
                     Some(msg) => {
                         Self::respond(self.tx.clone(), stream_id, msg)
@@ -444,6 +446,8 @@ impl HandlerContext {
                 Err(status) => Self::respond_with_status(self.tx.clone(), stream_id, status).await,
             },
             MESSAGE_TYPE_DATA => {
+                // no need to wait data message handling
+                drop(wait_tx);
                 // TODO(wllenyj): Compatible with golang behavior.
                 if (msg.header.flags & FLAG_REMOTE_CLOSED) == FLAG_REMOTE_CLOSED
                     && !msg.payload.is_empty()
@@ -492,7 +496,11 @@ impl HandlerContext {
         }
     }
 
-    async fn handle_request(&self, msg: GenMessage) -> StdResult<Option<Response>, Status> {
+    async fn handle_request(
+        &self,
+        msg: GenMessage,
+        wait_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> StdResult<Option<Response>, Status> {
         //TODO:
         //if header.stream_id <= self.last_stream_id {
         //    return Err;
@@ -513,10 +521,11 @@ impl HandlerContext {
         })?;
 
         if let Some(method) = srv.get_method(&req.method) {
+            drop(wait_tx);
             return self.handle_method(method, req_msg).await;
         }
         if let Some(stream) = srv.get_stream(&req.method) {
-            return self.handle_stream(stream, req_msg).await;
+            return self.handle_stream(stream, req_msg, wait_tx).await;
         }
         Err(get_status(
             Code::UNIMPLEMENTED,
@@ -572,6 +581,7 @@ impl HandlerContext {
         &self,
         stream: Arc<dyn StreamHandler + Send + Sync>,
         req_msg: Message<Request>,
+        wait_tx: tokio::sync::oneshot::Sender<()>,
     ) -> StdResult<Option<Response>, Status> {
         let stream_id = req_msg.header.stream_id;
         let req = req_msg.payload;
@@ -583,6 +593,9 @@ impl HandlerContext {
 
         let _remote_close = (req_msg.header.flags & FLAG_REMOTE_CLOSED) == FLAG_REMOTE_CLOSED;
         let _remote_open = (req_msg.header.flags & FLAG_REMOTE_OPEN) == FLAG_REMOTE_OPEN;
+
+        drop(wait_tx);
+
         let si = StreamInner::new(
             stream_id,
             self.tx.clone(),
