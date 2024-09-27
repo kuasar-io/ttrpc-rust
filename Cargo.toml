@@ -17,10 +17,12 @@ nix = "0.23.0"
 log = "0.4"
 byteorder = "1.3.2"
 thiserror = "1.0"
+uuid = { version = "1.1.2", features = ["v4"] }
 
 async-trait = { version = "0.1.31", optional = true }
-tokio = { version = "1", features = ["rt", "sync", "io-util", "macros", "time"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "io-util", "macros", "time", "fs"], optional = true }
 futures = { version = "0.3", optional = true }
+libsystemd = { version = "0.7.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = { version = "0.3.1", optional = true }
@@ -32,6 +34,7 @@ protobuf-codegen = "3.1.0"
 default = ["sync"]
 async = ["async-trait", "tokio", "futures", "tokio-vsock"]
 sync = []
+fdstore = ["libsystemd"]
 
 [package.metadata.docs.rs]
 all-features = true

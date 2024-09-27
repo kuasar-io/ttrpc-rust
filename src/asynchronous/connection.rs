@@ -17,6 +17,8 @@ use crate::error::Error;
 use crate::proto::GenMessage;
 
 use super::stream::SendingMessage;
+#[cfg(feature = "fdstore")]
+use crate::r#async::fdstore::MessageStore;
 
 pub trait Builder {
     type Reader;
@@ -37,10 +39,13 @@ pub trait ReaderDelegate {
     async fn wait_shutdown(&self);
     async fn disconnect(&self, e: Error, task: &mut task::JoinHandle<()>);
     async fn exit(&self);
-    async fn handle_msg(&self, msg: GenMessage);
+    // handle message with id, the id is only for message store.
+    async fn handle_msg(&self, id: u64, msg: GenMessage);
 }
 
 pub struct Connection<S, B: Builder> {
+    #[cfg(feature = "fdstore")]
+    name: String,
     reader: ReadHalf<S>,
     writer_task: task::JoinHandle<()>,
     reader_delegate: B::Reader,
@@ -53,7 +58,7 @@ where
     B::Reader: ReaderDelegate + Send + Sync + 'static,
     B::Writer: WriterDelegate + Send + Sync + 'static,
 {
-    pub fn new(conn: S, mut builder: B) -> Self {
+    pub fn new(conn: S, mut builder: B, #[cfg(feature = "fdstore")] name: String) -> Self {
         let (reader, mut writer) = split(conn);
 
         let (reader_delegate, mut writer_delegate) = builder.build();
@@ -73,6 +78,8 @@ where
         });
 
         Self {
+            #[cfg(feature = "fdstore")]
+            name,
             reader,
             writer_task,
             reader_delegate,
@@ -81,6 +88,8 @@ where
 
     pub async fn run(self) -> std::io::Result<()> {
         let Connection {
+            #[cfg(feature = "fdstore")]
+                name: _,
             mut reader,
             mut writer_task,
             reader_delegate,
@@ -91,7 +100,7 @@ where
                     match res {
                         Ok(msg) => {
                             trace!("Got Message {:?}", msg);
-                            reader_delegate.handle_msg(msg).await;
+                            reader_delegate.handle_msg(0, msg).await;
                         }
                         Err(e) => {
                             trace!("Read msg err: {:?}", e);
@@ -107,6 +116,65 @@ where
             }
         }
         reader_delegate.exit().await;
+        trace!("Reader task exit.");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "fdstore")]
+    pub async fn run_with_message_store(self, message_store: MessageStore) -> std::io::Result<()> {
+        let Connection {
+            name,
+            mut reader,
+            mut writer_task,
+            reader_delegate,
+        } = self;
+
+        let messages = message_store.get_messages(&name).await;
+        // the next message id should be larger than the message id before restart.
+        let mut id = 0u64;
+        for m in messages {
+            if m.id >= id {
+                id = m.id + 1;
+            }
+            // handle the stored request
+            reader_delegate.handle_msg(m.id, m.message).await;
+        }
+        loop {
+            select! {
+                res = GenMessage::read_from(&mut reader) => {
+                    match res {
+                        Ok(msg) => {
+                            trace!("Got Message {:?}", msg);
+                            message_store.insert(name.clone(), id, msg.clone()).await;
+                            reader_delegate.handle_msg(id, msg).await;
+                            id += 1;
+                        }
+                        Err(e) => {
+                            trace!("Read msg err: {:?}", e);
+                            reader_delegate.disconnect(e, &mut writer_task).await;
+                            break;
+                        }
+                    }
+                }
+                _v = reader_delegate.wait_shutdown() => {
+                    trace!("Receive shutdown.");
+                    break;
+                }
+            }
+        }
+        reader_delegate.exit().await;
+        #[cfg(feature = "fdstore")]
+        if let Err(e) = libsystemd::daemon::notify_with_fds(
+            false,
+            &[
+                libsystemd::daemon::NotifyState::Fdname(name.to_string()),
+                libsystemd::daemon::NotifyState::FdstoreRemove,
+            ],
+            &[],
+        ) {
+            warn!("failed to notify systemd to remove the fd {}: {}", name, e);
+        }
         trace!("Reader task exit.");
 
         Ok(())
