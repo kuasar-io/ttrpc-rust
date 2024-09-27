@@ -12,6 +12,8 @@ mod stream;
 #[doc(hidden)]
 mod utils;
 mod connection;
+#[cfg(feature = "fdstore")]
+mod fdstore;
 pub mod shutdown;
 mod unix_incoming;
 
