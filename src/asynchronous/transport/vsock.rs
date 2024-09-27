@@ -1,5 +1,5 @@
 use std::io::{Error as IoError, Result as IoResult};
-use std::os::fd::{FromRawFd as _, RawFd};
+use std::os::fd::{FromRawFd as _, RawFd, AsRawFd};
 
 use async_stream::stream;
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};

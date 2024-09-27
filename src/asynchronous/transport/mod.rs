@@ -1,4 +1,5 @@
 use std::io::{Error as IoError, Result as IoResult};
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 
 use futures::stream::{BoxStream, Stream, StreamExt as _};
@@ -8,7 +9,7 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 pub struct Listener(BoxStream<'static, IoResult<Socket>>);
-pub struct Socket(Pin<Box<dyn AsyncReadWrite + Send + Sync + 'static>>);
+pub struct Socket(Pin<Box<dyn AsyncReadWrite + Send + Sync + 'static>>, RawFd);
 
 macro_rules! io_other {
     ($fmt_str:literal, $($args:expr),*) => {
@@ -32,7 +33,7 @@ mod vsock;
 mod windows;
 
 impl Listener {
-    pub fn new<S: AsyncRead + AsyncWrite + Send + Sync + 'static>(
+    pub fn new<S: AsyncRead + AsyncWrite + AsRawFd + Send + Sync + 'static>(
         listener: impl Stream<Item = IoResult<S>> + Send + 'static,
     ) -> Self {
         Self(listener.map(|s| s.map(Socket::new)).boxed())
@@ -66,8 +67,9 @@ impl Listener {
 }
 
 impl Socket {
-    pub fn new(socket: impl AsyncRead + AsyncWrite + Send + Sync + 'static) -> Self {
-        Self(Box::pin(socket))
+    pub fn new(socket: impl AsyncRead + AsyncWrite + AsRawFd + Send + Sync + 'static) -> Self {
+        let fd = socket.as_raw_fd();
+        Self(Box::pin(socket), fd)
     }
 
     pub async fn connect(addr: impl AsRef<str>) -> IoResult<Self> {
@@ -155,5 +157,11 @@ impl AsyncWrite for Socket {
 
     fn is_write_vectored(&self) -> bool {
         self.0.is_write_vectored()
+    }
+}
+
+impl AsRawFd for Socket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.1
     }
 }

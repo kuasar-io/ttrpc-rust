@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
 use std::io::{Error as IoError, Result as IoResult};
-use std::os::fd::{FromRawFd as _, RawFd};
+use std::os::fd::{FromRawFd as _, RawFd, AsRawFd};
 use std::os::unix::net::{
     SocketAddr, UnixListener as StdUnixListener, UnixStream as StdUnixStream,
 };

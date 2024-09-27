@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
 use std::io::{Error as IoError, Result as IoResult};
-use std::os::fd::{FromRawFd as _, RawFd};
+use std::os::fd::{FromRawFd as _, RawFd, AsRawFd};
 use std::net::{
     SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream,
 };
