@@ -78,6 +78,8 @@ pub struct Server {
 
     #[cfg(feature = "fdstore")]
     message_store: Option<MessageStore>,
+    #[cfg(feature = "fdstore")]
+    fdstore_enabled: bool,
 }
 
 impl Default for Server {
@@ -90,6 +92,8 @@ impl Default for Server {
             stop_listen_tx: None,
             #[cfg(feature = "fdstore")]
             message_store: Default::default(),
+            #[cfg(feature = "fdstore")]
+            fdstore_enabled: false,
         }
     }
 }
@@ -131,6 +135,12 @@ impl Server {
         Ok(self)
     }
 
+    #[cfg(feature = "fdstore")]
+    pub fn enable_fdstore(mut self) -> Self {
+        self.fdstore_enabled = true;
+        self
+    }
+
     pub fn register_service(mut self, new: HashMap<String, Service>) -> Server {
         let services = Arc::get_mut(&mut self.services).unwrap();
         services.extend(new);
@@ -153,7 +163,10 @@ impl Server {
         match self.domain.as_ref() {
             Some(Domain::Unix) => {
                 #[cfg(feature = "fdstore")]
-                self.serve_stored_conns().await?;
+                if self.fdstore_enabled {
+                    self.serve_stored_conns().await?;
+                }
+
                 let sys_unix_listener;
                 unsafe {
                     sys_unix_listener = SysUnixListener::from_raw_fd(listenfd);
@@ -380,16 +393,20 @@ async fn spawn_connection_handler<C>(
     };
     let conn = Connection::new(conn, delegate, sock_name.clone());
     let message_store = message_store.clone();
-    if let Err(e) = libsystemd::daemon::notify_with_fds(
-        false,
-        &[
-            libsystemd::daemon::NotifyState::Fdname(sock_name.to_string()),
-            libsystemd::daemon::NotifyState::Fdstore,
-        ],
-        &[fd],
-    ) {
-        warn!("failed to notify fds to systemd: {}", e);
+    // fdstore is not enable if message store is None
+    if message_store.is_some() {
+        if let Err(e) = libsystemd::daemon::notify_with_fds(
+            false,
+            &[
+                libsystemd::daemon::NotifyState::Fdname(sock_name.to_string()),
+                libsystemd::daemon::NotifyState::Fdstore,
+            ],
+            &[fd],
+        ) {
+            warn!("failed to notify fds to systemd: {}", e);
+        }
     }
+
     spawn(async move {
         #[cfg(feature = "fdstore")]
         if let Some(store) = message_store {
