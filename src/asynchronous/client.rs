@@ -54,9 +54,16 @@ impl Client {
             rx: Some(rx),
             streams: req_map.clone(),
         };
-
-        let conn = Connection::new(stream, delegate);
-        tokio::spawn(async move { conn.run().await });
+        #[cfg(not(feature = "fdstore"))]
+        {
+            let conn = Connection::new(stream, delegate);
+            tokio::spawn(async move { conn.run().await });
+        }
+        #[cfg(feature = "fdstore")]
+        {
+            let conn = Connection::new(stream, delegate, "".to_string());
+            tokio::spawn(async move { conn.run().await });
+        }
 
         Client {
             req_tx,
@@ -254,7 +261,7 @@ impl ReaderDelegate for ClientReader {
 
     async fn exit(&self) {}
 
-    async fn handle_msg(&self, msg: GenMessage) {
+    async fn handle_msg(&self, _id: u64, msg: GenMessage) {
         let req_map = self.streams.clone();
         tokio::spawn(async move {
             let resp_tx = match msg.header.type_ {

@@ -46,6 +46,9 @@ use crate::r#async::stream::{
 use crate::r#async::utils;
 use crate::r#async::{MethodHandler, StreamHandler, TtrpcContext};
 
+#[cfg(feature = "fdstore")]
+use crate::r#async::fdstore::MessageStore;
+
 const DEFAULT_CONN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(5000);
 const DEFAULT_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10000);
 
@@ -72,6 +75,11 @@ pub struct Server {
 
     shutdown: shutdown::Notifier,
     stop_listen_tx: Option<Sender<Sender<RawFd>>>,
+
+    #[cfg(feature = "fdstore")]
+    message_store: Option<MessageStore>,
+    #[cfg(feature = "fdstore")]
+    fdstore_enabled: bool,
 }
 
 impl Default for Server {
@@ -82,6 +90,10 @@ impl Default for Server {
             domain: None,
             shutdown: shutdown::with_timeout(DEFAULT_SERVER_SHUTDOWN_TIMEOUT).0,
             stop_listen_tx: None,
+            #[cfg(feature = "fdstore")]
+            message_store: Default::default(),
+            #[cfg(feature = "fdstore")]
+            fdstore_enabled: false,
         }
     }
 }
@@ -123,6 +135,12 @@ impl Server {
         Ok(self)
     }
 
+    #[cfg(feature = "fdstore")]
+    pub fn enable_fdstore(mut self) -> Self {
+        self.fdstore_enabled = true;
+        self
+    }
+
     pub fn register_service(mut self, new: HashMap<String, Service>) -> Server {
         let services = Arc::get_mut(&mut self.services).unwrap();
         services.extend(new);
@@ -140,9 +158,15 @@ impl Server {
 
     pub async fn start(&mut self) -> Result<()> {
         let listenfd = self.get_listenfd()?;
+        debug!("start ttrpc server");
 
         match self.domain.as_ref() {
             Some(Domain::Unix) => {
+                #[cfg(feature = "fdstore")]
+                if self.fdstore_enabled {
+                    self.serve_stored_conns().await?;
+                }
+
                 let sys_unix_listener;
                 unsafe {
                     sys_unix_listener = SysUnixListener::from_raw_fd(listenfd);
@@ -168,6 +192,87 @@ impl Server {
         }
     }
 
+    // serve_stored_conns serves the stored connections in fd store of systemd.
+    // when "systemd" feature enabled, all the established connections
+    // will send to systemd by calling `notify_with_fds` of libsystemd, with `NotifyState::Fdstore`
+    // and systemd will keep it unless we remove it, also by calling `notify_with_fds` with `NotifyState::FdstoreRemove`
+    // The service can receive the fd from fdstore by calling `receive_descriptors_with_names`, everytime it restart.
+    // we also create a memfd of name "message_store" and send it to fdstore, every received ttrpc request will be stored in it.
+    // so everytime we restart, we can get the stored connections and unfinished request in the connections,
+    // we can continue serve the connections so that the ttrpc session will not be interrputed by the service restart.
+    // but there is a restriction of this: the ttrpc service should be reentrant.
+    #[cfg(feature = "fdstore")]
+    async fn serve_stored_conns(&mut self) -> Result<()> {
+        use std::ffi::CStr;
+        use std::os::fd::IntoRawFd;
+
+        use libsystemd::daemon::NotifyState;
+        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        use tokio::{fs::File, net::UnixStream};
+
+        use crate::asynchronous::fdstore::MessageStore;
+        debug!("serve stored connection from systemd");
+
+        let fds = libsystemd::activation::receive_descriptors_with_names(false).unwrap_or_default();
+        let mut mem_fd = None;
+        let mut conns = HashMap::new();
+        for (fd, name) in fds {
+            let fd = fd.into_raw_fd();
+            debug!("received an fd {} from fd store: {}", name, fd);
+            if name == "message_store" {
+                mem_fd = Some(fd);
+                continue;
+            }
+            //println!("got a listen fd: {}", fd);
+            let conn = unsafe {
+                UnixStream::from_std(std::os::unix::net::UnixStream::from_raw_fd(fd))
+                    .map_err(|e| Error::Socket(e.to_string()))?
+            };
+            conns.insert(name.clone(), conn);
+            libsystemd::daemon::notify_with_fds(
+                false,
+                &[NotifyState::Fdname(name), NotifyState::FdstoreRemove],
+                &[],
+            )
+            .unwrap();
+        }
+        let mem_fd = if let Some(fd) = mem_fd {
+            fd
+        } else {
+            let fd = memfd_create(
+                CStr::from_bytes_with_nul(b"message_store\0").unwrap(),
+                MemFdCreateFlag::MFD_CLOEXEC,
+            )?;
+            libsystemd::daemon::notify_with_fds(
+                false,
+                &[
+                    NotifyState::Fdname("message_store".to_string()),
+                    NotifyState::Fdstore,
+                ],
+                &[fd],
+            )
+            .unwrap();
+            fd
+        };
+        let mem_file = unsafe { File::from_raw_fd(mem_fd) };
+        let store = MessageStore::load(mem_file).await?;
+        self.message_store = Some(store);
+        let shutdown_waiter = self.shutdown.subscribe();
+        for (name, v) in conns {
+            let fd = v.as_raw_fd();
+            spawn_connection_handler(
+                fd,
+                v,
+                self.services.clone(),
+                shutdown_waiter.clone(),
+                self.message_store.clone(),
+                name,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     async fn do_start<I, S>(&mut self, mut incoming: I) -> Result<()>
     where
         I: Stream<Item = std::io::Result<S>> + Unpin + Send + 'static + AsRawFd,
@@ -179,7 +284,8 @@ impl Server {
 
         let (stop_listen_tx, mut stop_listen_rx) = channel(1);
         self.stop_listen_tx = Some(stop_listen_tx);
-
+        #[cfg(feature = "fdstore")]
+        let message_store = self.message_store.clone();
         spawn(async move {
             loop {
                 select! {
@@ -189,13 +295,23 @@ impl Server {
                             match conn {
                                 Ok(conn) => {
                                     let fd = conn.as_raw_fd();
-                                    // spawn a connection handler, would not block
-                                    spawn_connection_handler(
-                                        fd,
-                                        conn,
-                                        services.clone(),
-                                        shutdown_waiter.clone(),
-                                    ).await;
+                                        // spawn a connection handler, would not block
+                                        #[cfg(feature = "fdstore")]
+                                        spawn_connection_handler(
+                                            fd,
+                                            conn,
+                                            services.clone(),
+                                            shutdown_waiter.clone(),
+                                            message_store.clone(),
+                                            uuid::Uuid::new_v4().to_string(),
+                                        ).await;
+                                        #[cfg(not(feature = "fdstore"))]
+                                        spawn_connection_handler(
+                                            fd,
+                                            conn,
+                                            services.clone(),
+                                            shutdown_waiter.clone(),
+                                        ).await;
                                 }
                                 Err(e) => {
                                     error!("{:?}", e)
@@ -256,6 +372,62 @@ impl Server {
     }
 }
 
+#[cfg(feature = "fdstore")]
+async fn spawn_connection_handler<C>(
+    fd: RawFd,
+    conn: C,
+    services: Arc<HashMap<String, Service>>,
+    shutdown_waiter: shutdown::Waiter,
+    #[cfg(feature = "fdstore")] message_store: Option<MessageStore>,
+    #[cfg(feature = "fdstore")] sock_name: String,
+) where
+    C: AsyncRead + AsyncWrite + AsRawFd + Send + 'static,
+{
+    let delegate = ServerBuilder {
+        fd,
+        services,
+        streams: Arc::new(Mutex::new(HashMap::new())),
+        shutdown_waiter,
+        message_store: message_store.clone(),
+        sock_name: sock_name.clone(),
+    };
+    let conn = Connection::new(conn, delegate, sock_name.clone());
+    let message_store = message_store.clone();
+    // fdstore is not enable if message store is None
+    if message_store.is_some() {
+        if let Err(e) = libsystemd::daemon::notify_with_fds(
+            false,
+            &[
+                libsystemd::daemon::NotifyState::Fdname(sock_name.to_string()),
+                libsystemd::daemon::NotifyState::Fdstore,
+            ],
+            &[fd],
+        ) {
+            warn!("failed to notify fds to systemd: {}", e);
+        }
+    }
+
+    spawn(async move {
+        #[cfg(feature = "fdstore")]
+        if let Some(store) = message_store {
+            conn.run_with_message_store(store)
+                .await
+                .map_err(|e| {
+                    trace!("connection run error. {}", e);
+                })
+                .ok();
+        } else {
+            conn.run()
+                .await
+                .map_err(|e| {
+                    trace!("connection run error. {}", e);
+                })
+                .ok();
+        }
+    });
+}
+
+#[cfg(not(feature = "fdstore"))]
 async fn spawn_connection_handler<C>(
     fd: RawFd,
     conn: C,
@@ -271,6 +443,7 @@ async fn spawn_connection_handler<C>(
         shutdown_waiter,
     };
     let conn = Connection::new(conn, delegate);
+
     spawn(async move {
         conn.run()
             .await
@@ -298,6 +471,10 @@ struct ServerBuilder {
     services: Arc<HashMap<String, Service>>,
     streams: Arc<Mutex<HashMap<u32, ResultSender>>>,
     shutdown_waiter: shutdown::Waiter,
+    #[cfg(feature = "fdstore")]
+    message_store: Option<MessageStore>,
+    #[cfg(feature = "fdstore")]
+    sock_name: String,
 }
 
 impl Builder for ServerBuilder {
@@ -317,6 +494,10 @@ impl Builder for ServerBuilder {
                 streams: self.streams.clone(),
                 server_shutdown: self.shutdown_waiter.clone(),
                 handler_shutdown: disconnect_notifier,
+                #[cfg(feature = "fdstore")]
+                message_store: self.message_store.clone(),
+                #[cfg(feature = "fdstore")]
+                sock_name: self.sock_name.clone(),
             },
             ServerWriter { rx },
         )
@@ -343,6 +524,10 @@ struct ServerReader {
     streams: Arc<Mutex<HashMap<u32, ResultSender>>>,
     server_shutdown: shutdown::Waiter,
     handler_shutdown: shutdown::Notifier,
+    #[cfg(feature = "fdstore")]
+    sock_name: String,
+    #[cfg(feature = "fdstore")]
+    message_store: Option<MessageStore>,
 }
 
 #[async_trait]
@@ -368,13 +553,34 @@ impl ReaderDelegate for ServerReader {
             .ok();
     }
 
-    async fn handle_msg(&self, msg: GenMessage) {
+    #[cfg(not(feature = "fdstore"))]
+    async fn handle_msg(&self, _id: u64, msg: GenMessage) {
         let handler_shutdown_waiter = self.handler_shutdown.subscribe();
         let context = self.context();
         let (wait_tx, wait_rx) = tokio::sync::oneshot::channel::<()>();
         spawn(async move {
             select! {
                 _ = context.handle_msg(msg, wait_tx) => {}
+                _ = handler_shutdown_waiter.wait_shutdown() => {}
+            }
+        });
+        wait_rx.await.unwrap_or_default();
+    }
+
+    #[cfg(feature = "fdstore")]
+    async fn handle_msg(&self, id: u64, msg: GenMessage) {
+        let handler_shutdown_waiter = self.handler_shutdown.subscribe();
+        let context = self.context();
+        let message_store = self.message_store.clone();
+        let sock_name = self.sock_name.clone();
+        let (wait_tx, wait_rx) = tokio::sync::oneshot::channel::<()>();
+        spawn(async move {
+            select! {
+                _ = context.handle_msg(msg, wait_tx) => {
+                    if let Some(store) = message_store {
+                        store.remove(sock_name, id).await;
+                    }
+                }
                 _ = handler_shutdown_waiter.wait_shutdown() => {}
             }
         });
