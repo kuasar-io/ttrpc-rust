@@ -155,7 +155,6 @@ const VMADDR_CID_HOST: u32 = 0;
 pub(crate) fn do_bind(sockaddr: &str) -> Result<(RawFd, Domain)> {
     let (fd, domain, sockaddr) = make_socket((sockaddr, VMADDR_CID_ANY))?;
 
-    setsockopt(fd, sockopt::ReusePort, &true)?;
     bind(fd, &sockaddr).map_err(err_to_others_err!(e, ""))?;
 
     Ok((fd, domain))
